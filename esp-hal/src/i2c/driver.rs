@@ -1,3 +1,6 @@
+/// I2c driver
+/// This implements the lower level parts of the driver.
+
 use fugit::HertzU32;
 
 use crate::{

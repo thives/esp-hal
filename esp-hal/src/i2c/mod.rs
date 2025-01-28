@@ -9,6 +9,7 @@
 #![doc = crate::trm_markdown_link!("i2c")]
 
 mod driver;
+mod i2c;
 pub mod info;
 pub mod master;
 pub mod slave;

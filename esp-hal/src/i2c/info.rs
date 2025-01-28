@@ -1,3 +1,6 @@
+//! # I2C driver info struct
+#![doc(hidden)]
+
 use crate::{
     gpio::{InputSignal, OutputSignal},
     i2c::Event,

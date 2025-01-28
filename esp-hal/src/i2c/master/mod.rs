@@ -29,14 +29,10 @@ use enumset::EnumSet;
 
 use crate::{
     gpio::{
-        interconnect::{OutputConnection, PeripheralOutput},
-        InputSignal,
-        OutputSignal,
         PinGuard,
-        Pull,
+        interconnect::PeripheralOutput,
     },
     i2c::{
-        AnyI2c,
         Config,
         ConfigError,
         Error,
@@ -45,50 +41,26 @@ use crate::{
         Instance,
         Operation,
         OpKind,
+        i2c::I2c,
     },
-    i2c::driver::Driver,
     interrupt::{InterruptConfigurable, InterruptHandler},
-    peripheral::{Peripheral, PeripheralRef},
+    peripheral::Peripheral,
     private,
-    system::{PeripheralClockControl, PeripheralGuard},
+    system::PeripheralGuard,
     Async,
     Blocking,
     DriverMode,
 };
 
-/// I2C driver
-///
-/// ### I2C initialization and communication with the device
-/// ```rust, no_run
-#[doc = crate::before_snippet!()]
-/// # use esp_hal::i2c::master::{Config, I2c};
-/// # const DEVICE_ADDR: u8 = 0x77;
-/// let mut i2c = I2c::new(
-///     peripherals.I2C0,
-///     Config::default(),
-/// )
-/// .unwrap()
-/// .with_sda(peripherals.GPIO1)
-/// .with_scl(peripherals.GPIO2);
-///
-/// let mut data = [0u8; 22];
-/// i2c.write_read(DEVICE_ADDR, &[0xaa], &mut data).ok();
-/// # }
-/// ```
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct I2c<'d, Dm: DriverMode> {
-    i2c: PeripheralRef<'d, AnyI2c>,
+/// I2c master
+pub struct I2cMaster<'d, Dm: DriverMode> {
+    i2c: I2c<'d>,
     phantom: PhantomData<Dm>,
-    config: Config,
-    guard: PeripheralGuard,
-    sda_pin: PinGuard,
-    scl_pin: PinGuard,
 }
 
 #[cfg(any(doc, feature = "unstable"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "unstable")))]
-impl<Dm: DriverMode> SetConfig for I2c<'_, Dm> {
+impl<Dm: DriverMode> SetConfig for I2cMaster<'_, Dm> {
     type Config = Config;
     type ConfigError = ConfigError;
 
@@ -97,11 +69,11 @@ impl<Dm: DriverMode> SetConfig for I2c<'_, Dm> {
     }
 }
 
-impl<Dm: DriverMode> embedded_hal::i2c::ErrorType for I2c<'_, Dm> {
+impl<Dm: DriverMode> embedded_hal::i2c::ErrorType for I2cMaster<'_, Dm> {
     type Error = Error;
 }
 
-impl<Dm: DriverMode> embedded_hal::i2c::I2c for I2c<'_, Dm> {
+impl embedded_hal::i2c::I2c for I2cMaster<'_, Blocking> {
     fn transaction(
         &mut self,
         address: u8,
@@ -111,90 +83,34 @@ impl<Dm: DriverMode> embedded_hal::i2c::I2c for I2c<'_, Dm> {
             I2cAddress::SevenBit(address),
             operations.iter_mut().map(Operation::from),
         )
-        .inspect_err(|_| self.internal_recover())
+        .inspect_err(|_| self.i2c.internal_recover())
     }
 }
 
-impl<'d, Dm: DriverMode> I2c<'d, Dm> {
-    fn driver(&self) -> Driver<'_> {
-        Driver {
-            info: self.i2c.info(),
-            state: self.i2c.state(),
-        }
+impl embedded_hal_async::i2c::I2c for I2cMaster<'_, Async> {
+    async fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [EhalOperation<'_>],
+    ) -> Result<(), Self::Error> {
+        self.transaction_impl_async(address.into(), operations.iter_mut().map(Operation::from))
+            .await
+            .inspect_err(|_| self.i2c.internal_recover())
     }
+}
 
-    fn internal_recover(&self) {
-        PeripheralClockControl::disable(self.driver().info.peripheral);
-        PeripheralClockControl::enable(self.driver().info.peripheral);
-        PeripheralClockControl::reset(self.driver().info.peripheral);
 
-        // We know the configuration is valid, we can ignore the result.
-        _ = self.driver().setup(&self.config);
-    }
-
+impl<'d, Dm: DriverMode> I2cMaster<'d, Dm> {
     /// Applies a new configuration.
     pub fn apply_config(&mut self, config: &Config) -> Result<(), ConfigError> {
-        self.driver().setup(config)?;
-        self.config = *config;
-        Ok(())
-    }
-
-    fn transaction_impl<'a>(
-        &mut self,
-        address: I2cAddress,
-        operations: impl Iterator<Item = Operation<'a>>,
-    ) -> Result<(), Error> {
-        let mut last_op: Option<OpKind> = None;
-        // filter out 0 length read operations
-        let mut op_iter = operations
-            .filter(|op| op.is_write() || !op.is_empty())
-            .peekable();
-
-        while let Some(op) = op_iter.next() {
-            let next_op = op_iter.peek().map(|v| v.kind());
-            let kind = op.kind();
-            match op {
-                Operation::Write(buffer) => {
-                    // execute a write operation:
-                    // - issue START/RSTART if op is different from previous
-                    // - issue STOP if op is the last one
-                    self.driver().write_blocking(
-                        address,
-                        buffer,
-                        !matches!(last_op, Some(OpKind::Write)),
-                        next_op.is_none(),
-                    )?;
-                }
-                Operation::Read(buffer) => {
-                    // execute a read operation:
-                    // - issue START/RSTART if op is different from previous
-                    // - issue STOP if op is the last one
-                    // - will_continue is true if there is another read operation next
-                    self.driver().read_blocking(
-                        address,
-                        buffer,
-                        !matches!(last_op, Some(OpKind::Read)),
-                        next_op.is_none(),
-                        matches!(next_op, Some(OpKind::Read)),
-                    )?;
-                }
-            }
-
-            last_op = Some(kind);
-        }
-
-        Ok(())
+        self.i2c.apply_config(config)
     }
 
     /// Connect a pin to the I2C SDA signal.
     ///
     /// This will replace previous pin assignments for this signal.
     pub fn with_sda(mut self, sda: impl Peripheral<P = impl PeripheralOutput> + 'd) -> Self {
-        let info = self.driver().info;
-        let input = info.sda_input;
-        let output = info.sda_output;
-        Self::connect_pin(sda, input, output, &mut self.sda_pin);
-
+        self.i2c.with_sda(sda);
         self
     }
 
@@ -202,35 +118,12 @@ impl<'d, Dm: DriverMode> I2c<'d, Dm> {
     ///
     /// This will replace previous pin assignments for this signal.
     pub fn with_scl(mut self, scl: impl Peripheral<P = impl PeripheralOutput> + 'd) -> Self {
-        let info = self.driver().info;
-        let input = info.scl_input;
-        let output = info.scl_output;
-        Self::connect_pin(scl, input, output, &mut self.scl_pin);
-
+        self.i2c.with_scl(scl);
         self
-    }
-
-    fn connect_pin(
-        pin: impl Peripheral<P = impl PeripheralOutput> + 'd,
-        input: InputSignal,
-        output: OutputSignal,
-        guard: &mut PinGuard,
-    ) {
-        crate::into_mapped_ref!(pin);
-        // avoid the pin going low during configuration
-        pin.set_output_high(true);
-
-        pin.set_to_open_drain_output();
-        pin.enable_input(true);
-        pin.pull_direction(Pull::Up);
-
-        input.connect_to(pin.reborrow());
-
-        *guard = OutputConnection::connect_with_guard(pin, output);
     }
 }
 
-impl<'d> I2c<'d, Blocking> {
+impl<'d> I2cMaster<'d, Blocking> {
     /// Create a new I2C instance.
     pub fn new(
         i2c: impl Peripheral<P = impl Instance> + 'd,
@@ -243,18 +136,20 @@ impl<'d> I2c<'d, Blocking> {
         let sda_pin = PinGuard::new_unconnected(i2c.info().sda_output);
         let scl_pin = PinGuard::new_unconnected(i2c.info().scl_output);
 
-        let i2c = I2c {
-            i2c,
+        let master = I2cMaster {
+            i2c: I2c {
+                i2c,
+                config,
+                guard,
+                sda_pin,
+                scl_pin,
+            },
             phantom: PhantomData,
-            config,
-            guard,
-            sda_pin,
-            scl_pin,
         };
 
-        i2c.driver().setup(&i2c.config)?;
+        master.i2c.driver().setup(&master.i2c.config)?;
 
-        Ok(i2c)
+        Ok(master)
     }
 
     #[cfg_attr(
@@ -273,44 +168,40 @@ impl<'d> I2c<'d, Blocking> {
     /// [crate::DEFAULT_INTERRUPT_HANDLER]
     #[instability::unstable]
     pub fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
-        self.i2c.info().set_interrupt_handler(handler);
+        self.i2c.driver().info.set_interrupt_handler(handler);
     }
 
     /// Listen for the given interrupts
     #[instability::unstable]
     pub fn listen(&mut self, interrupts: impl Into<EnumSet<Event>>) {
-        self.i2c.info().enable_listen(interrupts.into(), true)
+        self.i2c.driver().info.enable_listen(interrupts.into(), true)
     }
 
     /// Unlisten the given interrupts
     #[instability::unstable]
     pub fn unlisten(&mut self, interrupts: impl Into<EnumSet<Event>>) {
-        self.i2c.info().enable_listen(interrupts.into(), false)
+        self.i2c.driver().info.enable_listen(interrupts.into(), false)
     }
 
     /// Gets asserted interrupts
     #[instability::unstable]
     pub fn interrupts(&mut self) -> EnumSet<Event> {
-        self.i2c.info().interrupts()
+        self.i2c.driver().info.interrupts()
     }
 
     /// Resets asserted interrupts
     #[instability::unstable]
     pub fn clear_interrupts(&mut self, interrupts: EnumSet<Event>) {
-        self.i2c.info().clear_interrupts(interrupts)
+        self.i2c.driver().info.clear_interrupts(interrupts)
     }
 
     /// Configures the I2C peripheral to operate in asynchronous mode.
-    pub fn into_async(mut self) -> I2c<'d, Async> {
-        self.set_interrupt_handler(self.driver().info.async_handler);
+    pub fn into_async(mut self) -> I2cMaster<'d, Async> {
+        self.set_interrupt_handler(self.i2c.driver().info.async_handler);
 
-        I2c {
+        I2cMaster {
             i2c: self.i2c,
             phantom: PhantomData,
-            config: self.config,
-            guard: self.guard,
-            sda_pin: self.sda_pin,
-            scl_pin: self.scl_pin,
         }
     }
 
@@ -328,9 +219,9 @@ impl<'d> I2c<'d, Blocking> {
     /// # }
     /// ```
     pub fn write<A: Into<I2cAddress>>(&mut self, address: A, buffer: &[u8]) -> Result<(), Error> {
-        self.driver()
+        self.i2c.driver()
             .write_blocking(address.into(), buffer, true, true)
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
     }
 
     /// Reads enough bytes from slave with `address` to fill `buffer`
@@ -352,9 +243,9 @@ impl<'d> I2c<'d, Blocking> {
         address: A,
         buffer: &mut [u8],
     ) -> Result<(), Error> {
-        self.driver()
+        self.i2c.driver()
             .read_blocking(address.into(), buffer, true, true, false)
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
     }
 
     /// Writes bytes to slave with address `address` and then reads enough bytes
@@ -380,13 +271,13 @@ impl<'d> I2c<'d, Blocking> {
     ) -> Result<(), Error> {
         let address = address.into();
 
-        self.driver()
+        self.i2c.driver()
             .write_blocking(address, write_buffer, true, read_buffer.is_empty())
-            .inspect_err(|_| self.internal_recover())?;
+            .inspect_err(|_| self.i2c.internal_recover())?;
 
-        self.driver()
+        self.i2c.driver()
             .read_blocking(address, read_buffer, true, true, false)
-            .inspect_err(|_| self.internal_recover())?;
+            .inspect_err(|_| self.i2c.internal_recover())?;
 
         Ok(())
     }
@@ -432,30 +323,73 @@ impl<'d> I2c<'d, Blocking> {
         operations: impl IntoIterator<Item = &'a mut Operation<'a>>,
     ) -> Result<(), Error> {
         self.transaction_impl(address.into(), operations.into_iter().map(Operation::from))
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
+    }
+
+    fn transaction_impl<'a>(
+        &mut self,
+        address: I2cAddress,
+        operations: impl Iterator<Item = Operation<'a>>,
+    ) -> Result<(), Error> {
+        let mut last_op: Option<OpKind> = None;
+        // filter out 0 length read operations
+        let mut op_iter = operations
+            .filter(|op| op.is_write() || !op.is_empty())
+            .peekable();
+
+        while let Some(op) = op_iter.next() {
+            let next_op = op_iter.peek().map(|v| v.kind());
+            let kind = op.kind();
+            match op {
+                Operation::Write(buffer) => {
+                    // execute a write operation:
+                    // - issue START/RSTART if op is different from previous
+                    // - issue STOP if op is the last one
+                    self.i2c.driver().write_blocking(
+                        address,
+                        buffer,
+                        !matches!(last_op, Some(OpKind::Write)),
+                        next_op.is_none(),
+                    )?;
+                }
+                Operation::Read(buffer) => {
+                    // execute a read operation:
+                    // - issue START/RSTART if op is different from previous
+                    // - issue STOP if op is the last one
+                    // - will_continue is true if there is another read operation next
+                    self.i2c.driver().read_blocking(
+                        address,
+                        buffer,
+                        !matches!(last_op, Some(OpKind::Read)),
+                        next_op.is_none(),
+                        matches!(next_op, Some(OpKind::Read)),
+                    )?;
+                }
+            }
+
+            last_op = Some(kind);
+        }
+
+        Ok(())
     }
 }
 
-impl private::Sealed for I2c<'_, Blocking> {}
+impl private::Sealed for I2cMaster<'_, Blocking> {}
 
-impl InterruptConfigurable for I2c<'_, Blocking> {
+impl InterruptConfigurable for I2cMaster<'_, Blocking> {
     fn set_interrupt_handler(&mut self, handler: InterruptHandler) {
-        self.i2c.info().set_interrupt_handler(handler);
+        self.i2c.driver().info.set_interrupt_handler(handler);
     }
 }
 
-impl<'d> I2c<'d, Async> {
+impl<'d> I2cMaster<'d, Async> {
     /// Configure the I2C peripheral to operate in blocking mode.
-    pub fn into_blocking(self) -> I2c<'d, Blocking> {
-        self.i2c.info().disable_interrupts();
+    pub fn into_blocking(self) -> I2cMaster<'d, Blocking> {
+        self.i2c.driver().info.disable_interrupts();
 
-        I2c {
+        I2cMaster {
             i2c: self.i2c,
             phantom: PhantomData,
-            config: self.config,
-            guard: self.guard,
-            sda_pin: self.sda_pin,
-            scl_pin: self.scl_pin,
         }
     }
 
@@ -465,10 +399,10 @@ impl<'d> I2c<'d, Async> {
         address: A,
         buffer: &[u8],
     ) -> Result<(), Error> {
-        self.driver()
+        self.i2c.driver()
             .write(address.into(), buffer, true, true)
             .await
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
     }
 
     /// Reads enough bytes from slave with `address` to fill `buffer`
@@ -477,10 +411,10 @@ impl<'d> I2c<'d, Async> {
         address: A,
         buffer: &mut [u8],
     ) -> Result<(), Error> {
-        self.driver()
+        self.i2c.driver()
             .read(address.into(), buffer, true, true, false)
             .await
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
     }
 
     /// Writes bytes to slave with address `address` and then reads enough
@@ -493,15 +427,15 @@ impl<'d> I2c<'d, Async> {
     ) -> Result<(), Error> {
         let address = address.into();
 
-        self.driver()
+        self.i2c.driver()
             .write(address, write_buffer, true, read_buffer.is_empty())
             .await
-            .inspect_err(|_| self.internal_recover())?;
+            .inspect_err(|_| self.i2c.internal_recover())?;
 
-        self.driver()
+        self.i2c.driver()
             .read(address, read_buffer, true, true, false)
             .await
-            .inspect_err(|_| self.internal_recover())?;
+            .inspect_err(|_| self.i2c.internal_recover())?;
 
         Ok(())
     }
@@ -532,7 +466,7 @@ impl<'d> I2c<'d, Async> {
     ) -> Result<(), Error> {
         self.transaction_impl_async(address.into(), operations.into_iter().map(Operation::from))
             .await
-            .inspect_err(|_| self.internal_recover())
+            .inspect_err(|_| self.i2c.internal_recover())
     }
 
     async fn transaction_impl_async<'a>(
@@ -554,7 +488,7 @@ impl<'d> I2c<'d, Async> {
                     // execute a write operation:
                     // - issue START/RSTART if op is different from previous
                     // - issue STOP if op is the last one
-                    self.driver()
+                    self.i2c.driver()
                         .write(
                             address,
                             buffer,
@@ -568,7 +502,7 @@ impl<'d> I2c<'d, Async> {
                     // - issue START/RSTART if op is different from previous
                     // - issue STOP if op is the last one
                     // - will_continue is true if there is another read operation next
-                    self.driver()
+                    self.i2c.driver()
                         .read(
                             address,
                             buffer,
@@ -584,17 +518,5 @@ impl<'d> I2c<'d, Async> {
         }
 
         Ok(())
-    }
-}
-
-impl embedded_hal_async::i2c::I2c for I2c<'_, Async> {
-    async fn transaction(
-        &mut self,
-        address: u8,
-        operations: &mut [EhalOperation<'_>],
-    ) -> Result<(), Self::Error> {
-        self.transaction_impl_async(address.into(), operations.iter_mut().map(Operation::from))
-            .await
-            .inspect_err(|_| self.internal_recover())
     }
 }
