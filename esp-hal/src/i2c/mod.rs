@@ -10,6 +10,11 @@
 
 pub mod master;
 
+#[cfg_attr(not(feature = "unstable"), doc(hidden))]
+crate::unstable_module! {
+    pub mod slave;
+}
+
 #[cfg(lp_i2c0)]
 crate::unstable_module! {
     pub mod lp_i2c;

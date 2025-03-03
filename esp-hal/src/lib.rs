@@ -141,6 +141,7 @@
 #![deny(missing_docs, rust_2018_idioms, rustdoc::all)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
+extern crate alloc;
 
 // MUST be the first module
 mod fmt;
